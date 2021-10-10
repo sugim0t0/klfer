@@ -1,10 +1,9 @@
-# KLFER
+# KLFER (ver 0.4)
 
 ## 概要
 
 KLFER(Kernel Logger for Function Entries and Returns)はカーネル空間のシンボル関数について入場(Entry)と退場(Return)時にログを吐く機能を持ちます。 
 それぞれのタイミングでタイムスタンプを押すこともできます。 
-また、複数の関数をグループとして登録し、グループ内での関数実行順としてシーケンス番号をログに付与できます。
 ログを吐くLKM(Loadable Kernel Module)と関数の登録等を制御するアプリケーションで構成されます。 
 ツリー構成は以下の様になります。
 ```
@@ -56,7 +55,7 @@ DebugモードでBuildすると、サンプル関数(klfer_sample_func, klfer_sa
 
 ```
 $ cd bin/
-$ sudo insmod klfer.ko
+$ insmod klfer.ko
 ```
 
 ### klferctl(アプリケーション)使い方
@@ -64,53 +63,64 @@ $ sudo insmod klfer.ko
 usageを```-h```オプションで出力できます。
 
 ```
-$ sudo ./klferctl -h
+$ ./klferctl -h
 Usage:
-  klferctl { -A <FUNC_NAME> [OPTIONS] | -D <FUNC_NAME> | -R | -e | -d | -p | -h }
+  klferctl {-A <FUNC>|-D <FUNC>|-R|{[-E|-d] [-J|-j] [-T<FMT>|-t]}|-S|-L|-h}
 
-    -A     Add new function to be registered
-    -D     Delete registered function
-    -R     Reset all registered functions
-    -e     Enable logger
-    -d     Disable logger
-    -p     Print registered functions
-    -h     Help
+    -A <FUNC>     Add new function(<FUNC>(*1)) to be registered
+    -D <FUNC>     Delete registered function(<FUNC>(*1))
+    -R            Reset (delete all registered functions and logs)
+    -E | -d       Enable logger(-E) / Disable logger(-d) (default: Disable)
+    -J | -j       Enable JIT print log(*3)(-J) / Disable JIT print log(-j) (default: Disable)
+    -T<FMT> | -t  Enable Timestamp(-T<FMT>(*2)) / Disable Timestamp(-t) (default: Enable)
+    -S            Dump current settings and registered functions
+    -L            Dump Logs
+    -h            Help
 
-  FUNC_NAME:
-    function name to be logged. MUST be symbol in kernel
+  SAMPLE COMMAND:
+    -s            Call sample function (klfer_sample_func)
+    ex) $ klferctl -s
 
-  OPTIONS:
-    -g <GROUP_NAME>  Group name to display in the log (default: "NO_GRP"
-    -t               Whether to show the timestamp in the log (default: no)
-
-  TEST COMMAND:
-    -T     Call sample function (klfer_sample_func)
- ex) # klferctl -T
+  (*1) <FUNC>       : Function name to be logged. MUST be symbol in kernel
+  (*2) <FMT> {0..2} : Timestamp output format
+     # -T0 > Absolute time (default)
+     # -T1 > Relative time from the first log
+     # -T2 > Relative time from the previous log
+  (*3) JIT(Just-In-Time) print log
+     # Print a log each time.
+     # So, timestamp contains printk processing time.
+     # Just-In-Time print log should not be used
+     #   if you want to measure function processing time.
 ```
 
 まずサンプル関数を登録します。
 
 ```
-$ sudo ./klferctl -A klfer_sample_func -g "SAMPLE_GRP" -t
-$ sudo ./klferctl -A klfer_sample_nested_func -g "SAMPLE_GRP" -t
+$ ./klferctl -A klfer_sample_func
+$ ./klferctl -A klfer_sample_nested_func
 ```
 
-登録した関数は```-p```オプションで確認できます。
+登録した関数や現在の設定値は```-S```オプションで確認できます。
 
 ```
-$ sudo ./klferctl -p
-[Func] function_name                    [Grp] [TS]
-[   0] klfer_sample_func                [  0] [ y]
-[   1] klfer_sample_nested_func         [  0] [ y]
+$ ./klferctl -S
+$ dmesg -t
+Logger        : Disable
+JIT print log : Disable
+Timestamp     : Enable
+Timestamp fmt : Absolute time
+[Indx] [Reg] function_name
+[   0] [ Y ] klfer_sample_func
+[   1] [ Y ] klfer_sample_nested_func
 ```
 
-関数登録後、ログを有効化します。
+関数登録後、ログを有効化します。(```-E```オプション)
 
 ```
-$ sudo ./klferctl -e
+$ ./klferctl -E
 ```
 
-DebugモードでBuildすると、テストコマンド```-T```でサンプル関数を実行できます。 
+DebugモードでBuildすると、テストコマンド```-s```でサンプル関数を実行できます。 
 サンプル関数は以下のような関数です。
 
 ```c
@@ -136,47 +146,72 @@ EXPORT_SYMBOL(klfer_sample_nested_func);
 登録した関数を実行させます。
 
 ```
-$ sudo ./klferctl -T
+$ ./klferctl -s
 ```
 
-ログを確認します。
+ログを確認します。(```-L```オプション)
 
 ```
-$ dmesg
-[ 1625852088291388526 nsec] SAMPLE_GRP[0] e klfer_sample_func
-enter klfer_sample_func()
-[ 1625852088291394477 nsec] SAMPLE_GRP[1] e klfer_sample_nested_func
-enter klfer_sample_nested_func()
-[ 1625852088291395901 nsec] SAMPLE_GRP[2] r klfer_sample_nested_func
-[ 1625852088291396742 nsec] SAMPLE_GRP[3] e klfer_sample_nested_func
-enter klfer_sample_nested_func()
-[ 1625852088291397684 nsec] SAMPLE_GRP[4] r klfer_sample_nested_func
-[ 1625852088291398345 nsec] SAMPLE_GRP[5] e klfer_sample_nested_func
-enter klfer_sample_nested_func()
-[ 1625852088291399225 nsec] SAMPLE_GRP[6] r klfer_sample_nested_func
-[ 1625852088291399863 nsec] SAMPLE_GRP[7] e klfer_sample_nested_func
-enter klfer_sample_nested_func()
-[ 1625852088291400770 nsec] SAMPLE_GRP[8] r klfer_sample_nested_func
-[ 1625852088291401401 nsec] SAMPLE_GRP[9] e klfer_sample_nested_func
-enter klfer_sample_nested_func()
-[ 1625852088291402305 nsec] SAMPLE_GRP[10] r klfer_sample_nested_func
-[ 1625852088291402980 nsec] SAMPLE_GRP[11] r klfer_sample_func
+$ ./klferctl -L
+$ dmesg -t
+[  1629399681954816044 nsec] [1] e klfer_sample_func
+[  1629399681954817612 nsec] [2] e klfer_sample_nested_func
+[  1629399681954818519 nsec] [3] r klfer_sample_nested_func
+[  1629399681954818786 nsec] [4] e klfer_sample_nested_func
+[  1629399681954819265 nsec] [5] r klfer_sample_nested_func
+[  1629399681954819420 nsec] [6] e klfer_sample_nested_func
+[  1629399681954819879 nsec] [7] r klfer_sample_nested_func
+[  1629399681954820032 nsec] [8] e klfer_sample_nested_func
+[  1629399681954820487 nsec] [9] r klfer_sample_nested_func
+[  1629399681954820652 nsec] [10] e klfer_sample_nested_func
+[  1629399681954821099 nsec] [11] r klfer_sample_nested_func
+[  1629399681954821253 nsec] [12] r klfer_sample_func
 ```
 
 ログのフォーマットは、
 ```
-[ <TIMESTAMP> nsec] <GROUP_NAME>[Sequence No.] <e(Entry)|r(Return)> function_name
+[ <TIMESTAMP> nsec] [Sequence No.] <e(Entry)|r(Return)> function_name
 ```
 となります。
 
-ログを無効化します。
+ログを無効化します。(```-d```オプション)
 
 ```
-$ sudo ./klferctl -d
+$ ./klferctl -d
 ```
+
+### Just-In-Timeログモード
+Just-In-Timeログモードでは```-L```オプションで後からまとめてログを出力するのではなく登録した関数が実行されるタイミングでログを出力するモードです。 
+このモードではログを出力するprintkや文字列コピー等の処理時間がログのタイムスタンプに含まれるため、関数の処理時間や複数の関数間の時間等を計測するという目的には適しませんが、登録した関数内で出力するログ等との前後関係が分かるというメリットがあります。 
+例えば、上記サンプル関数をJust-In-Timeログモードで実行してみます。(```-J```オプション)
+
+```
+$ ./klferctl -J -E
+$ ./klferctl -s
+$ dmesg -t
+[  1629400446130525404 nsec] [13] e klfer_sample_func
+enter klfer_sample_func()
+[  1629400446130527841 nsec] [14] e klfer_sample_nested_func
+enter klfer_sample_nested_func()
+[  1629400446130529416 nsec] [15] r klfer_sample_nested_func
+[  1629400446130530230 nsec] [16] e klfer_sample_nested_func
+enter klfer_sample_nested_func()
+[  1629400446130531211 nsec] [17] r klfer_sample_nested_func
+[  1629400446130531915 nsec] [18] e klfer_sample_nested_func
+enter klfer_sample_nested_func()
+[  1629400446130532870 nsec] [19] r klfer_sample_nested_func
+[  1629400446130533527 nsec] [20] e klfer_sample_nested_func
+enter klfer_sample_nested_func()
+[  1629400446130534475 nsec] [21] r klfer_sample_nested_func
+[  1629400446130535145 nsec] [22] e klfer_sample_nested_func
+enter klfer_sample_nested_func()
+[  1629400446130536093 nsec] [23] r klfer_sample_nested_func
+[  1629400446130536714 nsec] [24] r klfer_sample_func
+```
+先ほどの```-L```オプションで表示した場合と異なり、サンプル関数内で実行されるprintk(pr_debug)による出力が間に出力されています。
 
 ### LKMアンインストール
 
 ```
-$ sudo rmmod klfer
+$ rmmod klfer
 ```

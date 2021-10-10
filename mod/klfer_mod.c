@@ -15,13 +15,24 @@ static int  klfer_log(const char *, char);
 static int  klfer_register_func(struct klfer_func_cfg *);
 static int  klfer_unregister_func(struct klfer_func_cfg *);
 static void klfer_reset_funcs(void);
-static void klfer_print_reg_funcs(void);
-static void klfer_init_mod_data(void);
+static int  klfer_set_params(int);
+static void klfer_dump_settings(void);
+static void klfer_print_log(int);
+static void klfer_dump_logs(int, int);
+static int  klfer_init_mod_data(void);
+static void klfer_teardown_mod_data(void);
 static int  klfer_open(struct inode *, struct file *);
 static int  klfer_close(struct inode *, struct file *);
 static long klfer_ioctl(struct file *, unsigned int, unsigned long);
 static int  klfer_create_dev(void);
 static void klfer_delete_dev(void);
+
+/**
+ * Module parameter
+ */
+static int MLOGS = MAX_LOGS;
+module_param(MLOGS, int, S_IRUGO);
+MODULE_PARM_DESC(MLOGS, "Max number of logs to be saved.");
 
 /**
  * Module data info
@@ -47,7 +58,6 @@ static inline void klfer_unregister_kretprobe(int func_idx)
 {
     unregister_kretprobe(&modData.funcs[func_idx].krp);
     modData.funcs[func_idx].b_registered = false;
-    modData.grps[modData.funcs[func_idx].grp_idx].num_of_funcs--;
     pr_info("Unregister return probe at %s: %p\n",
             modData.funcs[func_idx].krp.kp.symbol_name,
             modData.funcs[func_idx].krp.kp.addr);
@@ -62,7 +72,7 @@ static inline void klfer_unregister_kretprobe(int func_idx)
  */
 static int  klfer_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    return klfer_log(ri->rp->kp.symbol_name, 'e');
+    return (modData.b_logging ? klfer_log(ri->rp->kp.symbol_name, 'e') : KLFER_OK);
 }
 
 /**
@@ -74,7 +84,7 @@ static int  klfer_entry_handler(struct kretprobe_instance *ri, struct pt_regs *r
  */
 static int klfer_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    return klfer_log(ri->rp->kp.symbol_name, 'r');
+    return (modData.b_logging ? klfer_log(ri->rp->kp.symbol_name, 'r') : KLFER_OK);
 }
 
 /**
@@ -86,47 +96,66 @@ static int klfer_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
  */
 static int klfer_log(const char *func_name, char event_id)
 {
-    char buf[MAX_STR_LEN * 3];
-    int offset = 0;
     int func_idx;
-    struct timespec time;
-    long timestamp;
 
-    for(func_idx=0; func_idx<MAX_REG_FUNCS; func_idx++)
+    if(modData.num_of_logs >= MAX_LOGS)
     {
+        pr_err("Err: No log space - %s\n", func_name);
+        return KLFER_ERR;
+    }
+    for(func_idx=0; func_idx<modData.num_of_funcs; func_idx++)
+    {
+        if(strcmp(func_name, modData.funcs[func_idx].func_name) == 0)
+        {
+            if(!modData.funcs[func_idx].b_registered)
+            {
+                pr_err("Err: Not registered - %s\n", func_name);
+                return KLFER_ERR;
+            }
+        }
         if(modData.funcs[func_idx].b_registered &&
            strcmp(func_name, modData.funcs[func_idx].func_name) == 0)
         {
             break;
         }
     }
-    if(func_idx >= MAX_REG_FUNCS)
+    if(func_idx >= modData.num_of_funcs)
     {
         pr_err("Err: No entry - %s\n", func_name);
         return KLFER_ERR;
     }
-    if(modData.funcs[func_idx].grp_idx >= MAX_GRPS)
+
+    if(modData.b_timestamp)
     {
-        pr_err("Err: No group - %s\n", func_name);
-        return KLFER_ERR;
+        getnstimeofday(&modData.logs[modData.num_of_logs].time);
+    }
+    modData.logs[modData.num_of_logs].func_idx = func_idx;
+    modData.logs[modData.num_of_logs].event_id = event_id;
+
+    if(modData.b_jit_log)
+    {
+        klfer_print_log(modData.num_of_logs);
     }
 
-    if(modData.b_logging)
-    {
-        if(modData.funcs[func_idx].b_rec_timestamp)
-        {
-            getnstimeofday(&time);
-            timestamp = time.tv_sec * NSEC_PER_SEC + time.tv_nsec;
-            offset = snprintf(buf, 32, "[ %ld nsec] ", timestamp);
-        }
-        snprintf(buf + offset, MAX_STR_LEN * 3 - offset, "%s[%d] %c %s",
-                 modData.grps[modData.funcs[func_idx].grp_idx].grp_id,
-                 modData.grps[modData.funcs[func_idx].grp_idx].cnt++,
-                 event_id,
-                 func_name);
-        pr_info("%s\n", buf);
-    }
+    modData.num_of_logs++;
     return KLFER_OK;
+}
+
+/**
+ * Dump logs
+ * @param[in] start_idx Start index of the log to print
+ * @param[in] num       Number of logs to print
+ */
+static void klfer_dump_logs(int start_idx, int num)
+{
+    int i;
+
+    if(start_idx >= modData.num_of_logs) return;
+    if((start_idx + num) > modData.num_of_logs) num = (modData.num_of_logs - start_idx);
+    for(i=start_idx; i<start_idx+num; i++)
+    {
+        klfer_print_log(i);
+    }
 }
 
 /**
@@ -138,24 +167,18 @@ static int klfer_log(const char *func_name, char event_id)
  */
 static int klfer_register_func(struct klfer_func_cfg *cfg)
 {
-    int func_idx, grp_idx, ret;
+    int func_idx, ret;
 
     /* search same function */
-    for(func_idx=0; func_idx<MAX_REG_FUNCS; func_idx++)
+    for(func_idx=0; func_idx<modData.num_of_funcs; func_idx++)
     {
-        if(modData.funcs[func_idx].b_registered == true &&
-           strcmp(modData.funcs[func_idx].func_name, cfg->func_name) == 0)
+        if(strcmp(modData.funcs[func_idx].func_name, cfg->func_name) == 0)
         {
-            pr_err("%s is already registered.\n", cfg->func_name);
-            return -EALREADY;
-        }
-    }
-    /* search free function index */
-    for(func_idx=0; func_idx<MAX_REG_FUNCS; func_idx++)
-    {
-        if(modData.funcs[func_idx].b_registered == false)
-        {
-            break;
+            if(modData.funcs[func_idx].b_registered == true)
+            {
+                pr_err("%s is already registered.\n", cfg->func_name);
+                return -EALREADY;
+            }
         }
     }
     if(func_idx == MAX_REG_FUNCS)
@@ -163,36 +186,13 @@ static int klfer_register_func(struct klfer_func_cfg *cfg)
         pr_err("Too many funcs registered.\n");
         return -ENOBUFS;
     }
-    strcpy(modData.funcs[func_idx].func_name, cfg->func_name);
+    if(func_idx == modData.num_of_funcs)
+    {
+        /* new function */
+        strcpy(modData.funcs[func_idx].func_name, cfg->func_name);
+        modData.num_of_funcs++;
+    }
     modData.funcs[func_idx].b_registered = true;
-    modData.funcs[func_idx].b_rec_timestamp = cfg->b_rec_timestamp;
-    /* search same group ID */
-    for(grp_idx=0; grp_idx<MAX_GRPS; grp_idx++)
-    {
-        if(modData.grps[grp_idx].num_of_funcs > 0 &&
-           strcmp(modData.grps[grp_idx].grp_id, cfg->grp_id) == 0)
-        {
-            /* found same group ID */
-            modData.grps[grp_idx].num_of_funcs++;
-            modData.funcs[func_idx].grp_idx = grp_idx;
-            break;
-        }
-    }
-    if(grp_idx == MAX_GRPS)
-    {
-        /* search free group index */
-        for(grp_idx=0; grp_idx<MAX_GRPS; grp_idx++)
-        {
-            if(modData.grps[grp_idx].num_of_funcs == 0)
-            {
-                /* found free group index */
-                strcpy(modData.grps[grp_idx].grp_id, cfg->grp_id);
-                modData.grps[grp_idx].cnt = 0;
-                modData.grps[grp_idx].num_of_funcs = 1;
-                break;
-            }
-        }
-    }
     /* register kretprobe */
     modData.funcs[func_idx].krp.kp.symbol_name = modData.funcs[func_idx].func_name;
     modData.funcs[func_idx].krp.handler = klfer_ret_handler;
@@ -221,7 +221,7 @@ static int klfer_unregister_func(struct klfer_func_cfg *cfg)
 {
     int func_idx;
 
-    for(func_idx=0; func_idx<MAX_REG_FUNCS; func_idx++)
+    for(func_idx=0; func_idx<modData.num_of_funcs; func_idx++)
     {
         if(modData.funcs[func_idx].b_registered &&
            strcmp(cfg->func_name, modData.funcs[func_idx].func_name) == 0)
@@ -248,47 +248,164 @@ static void klfer_reset_funcs(void)
             klfer_unregister_kretprobe(func_idx);
         }
     }
+    modData.num_of_funcs = 0;
 }
 
 /**
- * Print all registered functions
+ * Set control parameters
+ * @param[in] ctrl_param Control parameters
+ * @retval KLFER_OK  Success
+ * @retval KLFER_ERR Error
  */
-static void klfer_print_reg_funcs(void)
+static int klfer_set_params(int ctrl_param)
+{
+    /* Logger control */
+    if(ctrl_param & (UPDATE_FLAG << LOGGER_CTRL_SHIFT))
+    {
+        if(ctrl_param & (VALUE_BIT << LOGGER_CTRL_SHIFT))
+            modData.b_logging = true;
+        else
+            modData.b_logging = false;
+    }
+    /* JIT print log control */
+    if(ctrl_param & (UPDATE_FLAG << JIT_CTRL_SHIFT))
+    {
+        if(ctrl_param & (VALUE_BIT << JIT_CTRL_SHIFT))
+            modData.b_jit_log = true;
+        else
+            modData.b_jit_log = false;
+    }
+    /* Timestamp control */
+    if(ctrl_param & (UPDATE_FLAG << TIMESTAMP_CTRL_SHIFT))
+    {
+        /* Enable / Disable */
+        if(ctrl_param & (VALUE_BIT << TIMESTAMP_CTRL_SHIFT))
+            modData.b_timestamp = true;
+        else
+            modData.b_timestamp = false;
+
+        /* Format */
+        modData.timestamp_fmt = TS_FMT_MASK(ctrl_param);
+    }
+    return KLFER_OK;
+}
+
+/**
+ * Dump current settings and registered functions
+ */
+static void klfer_dump_settings(void)
 {
     int func_idx;
+    char ts_fmt[40];
 
-    printk("[Func] function_name                    [Grp] [TS]\n");
-    for(func_idx=0; func_idx<MAX_REG_FUNCS; func_idx++)
+    switch(modData.timestamp_fmt)
     {
-        if(modData.funcs[func_idx].b_registered)
-        {
-            printk("[%4d] %-32s [%3u] [%2c]\n",
-                    func_idx,
-                    modData.funcs[func_idx].func_name,
-                    modData.funcs[func_idx].grp_idx,
-                    (modData.funcs[func_idx].b_rec_timestamp ? 'y' : 'n'));
-        }
+    case TS_FMT_ABS:
+        strcpy(ts_fmt, "Absolute time");
+        break;
+    case TS_FMT_RLTV_FIRST:
+        strcpy(ts_fmt, "Relative time from the first log");
+        break;
+    case TS_FMT_RLTV_PREV:
+        strcpy(ts_fmt, "Relative time from the previous log");
+        break;
+    default:
+        strcpy(ts_fmt, "Unknown format");
+        break;
+    }
+
+    /* Dump parameter settings */
+    printk("Logger        : %s\n", (modData.b_logging ?   "Enable" : "Disable"));
+    printk("JIT print log : %s\n", (modData.b_jit_log ?   "Enable" : "Disable"));
+    printk("Timestamp     : %s\n", (modData.b_timestamp ? "Enable" : "Disable"));
+    printk("Timestamp fmt : %s\n", ts_fmt);
+
+    /* Dump registered functions */
+    printk("[Indx] [Reg] function_name\n");
+    for(func_idx=0; func_idx<modData.num_of_funcs; func_idx++)
+    {
+        printk("[%4d] [ %c ] %s\n", func_idx, (modData.funcs[func_idx].b_registered ? 'Y' : 'N'),
+                modData.funcs[func_idx].func_name);
     }
 }
 
 /**
- * Initialize module data
+ * Print event log
+ * @param[in] log_idx Log index (0 origin)
  */
-static void klfer_init_mod_data(void)
+static void klfer_print_log(int log_idx)
+{
+    char buf[MAX_STR_LEN * 3];
+    int offset = 0;
+    long timestamp;
+    struct klfer_log *log = &modData.logs[log_idx];
+    struct klfer_log *rltv_log = NULL;
+
+    if(modData.b_timestamp)
+    {
+        timestamp = log->time.tv_sec * NSEC_PER_SEC + log->time.tv_nsec;
+        switch(modData.timestamp_fmt)
+        {
+        case TS_FMT_RLTV_FIRST:
+            rltv_log = &modData.logs[0];
+            break;
+        case TS_FMT_RLTV_PREV:
+            if(log_idx > 0) rltv_log = &modData.logs[log_idx - 1];
+            else rltv_log = &modData.logs[0];
+            break;
+        default:
+            break;
+        }
+        if(rltv_log)
+            timestamp -= rltv_log->time.tv_sec * NSEC_PER_SEC + rltv_log->time.tv_nsec;
+        offset = snprintf(buf, 32, "[ %20ld nsec] ", timestamp);
+    }
+    snprintf(buf + offset, MAX_STR_LEN * 3 - offset, "[%d] %c %s",
+             log_idx + 1,
+             log->event_id,
+             modData.funcs[log->func_idx].func_name);
+    printk("%s\n", buf);
+}
+
+/**
+ * Initialize module data
+ * @retval KLFER_OK Success
+ * @retval -ENOBUFS Failed to kmalloc
+ */
+static int klfer_init_mod_data(void)
 {
     int i;
     modData.pclass = NULL;
     modData.pdev = NULL;
     atomic_set(&modData.open_available, 1);
+    modData.num_of_funcs = 0;
+    modData.num_of_logs = 0;
     modData.b_logging = false;
-    for(i=0; i<MAX_GRPS; i++)
-    {
-        modData.grps[i].num_of_funcs = 0;
-        modData.grps[i].cnt = 0;
-    }
+    modData.b_jit_log = false;
+    modData.b_timestamp = true;
+    modData.timestamp_fmt = TS_FMT_ABS;
     for(i=0; i<MAX_REG_FUNCS; i++)
     {
         modData.funcs[i].b_registered = false;
+    }
+    modData.logs = (struct klfer_log *)kmalloc(sizeof(struct klfer_log) * MLOGS, GFP_KERNEL);
+    if(!modData.logs)
+    {
+        return -ENOBUFS;
+    }
+
+    return KLFER_OK;
+}
+
+/**
+ * Teardown module data
+ */
+static void klfer_teardown_mod_data(void)
+{
+    klfer_reset_funcs();
+    if(modData.logs)
+    {
+        kfree(modData.logs);
     }
 }
 
@@ -329,14 +446,14 @@ static int klfer_close(struct inode *ind, struct file *filp)
  * @param[in] *filp Not use
  * @param[in] cmd   Request command
  * @param[in] arg   Argument pointer in user space
- * @retval KLFER_OK  Success
- * @retval -EALREADY Already enable logger / disable logger
- * @retval -EBADR    Request command is not supported
- * @retval -EFAULT   arg is pointed unacceptable space
+ * @retval KLFER_OK Success
+ * @retval -EINVAL  Request command is not supported
+ * @retval -EFAULT  arg is pointed unacceptable space
  */
 static long klfer_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     struct klfer_func_cfg func_cfg;
+    int ctrl_param;
     int ret = KLFER_OK;
     int err;
 
@@ -346,40 +463,25 @@ static long klfer_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     case KLFER_REG_FUNC_FLAG:
         err = copy_from_user(&func_cfg, (void *)arg, sizeof(func_cfg));
         if(err) goto ERR_COPY_FROM_USER;
-        ret = klfer_register_func(&func_cfg);
-        break;
-    case KLFER_UNREG_FUNC_FLAG:
-        err = copy_from_user(&func_cfg, (void *)arg, sizeof(func_cfg));
-        if(err) goto ERR_COPY_FROM_USER;
-        ret = klfer_unregister_func(&func_cfg);
+        if(func_cfg.b_reg)
+            ret = klfer_register_func(&func_cfg);
+        else
+            ret = klfer_unregister_func(&func_cfg);
         break;
     case KLFER_RESET_FLAG:
         klfer_reset_funcs();
+        modData.num_of_logs = 0;
         break;
-    case KLFER_ENABLE_LOG_FLAG:
-        if(modData.b_logging)
-        {
-            ret = -EALREADY;
-        }
-        else
-        {
-            pr_debug("Enable logger\n");
-            modData.b_logging = true;
-        }
+    case KLFER_SET_PARAMS_FLAG:
+        err = copy_from_user(&ctrl_param, (void *)arg, sizeof(ctrl_param));
+        if(err) goto ERR_COPY_FROM_USER;
+        ret = klfer_set_params(ctrl_param);
         break;
-    case KLFER_DISABLE_LOG_FLAG:
-        if(!modData.b_logging)
-        {
-            ret = -EALREADY;
-        }
-        else
-        {
-            modData.b_logging = false;
-            pr_debug("Disable logger\n");
-        }
+    case KLFER_DUMP_SETTINGS_FLAG:
+        klfer_dump_settings();
         break;
-    case KLFER_PRINT_REG_FUNCS_FLAG:
-        klfer_print_reg_funcs();
+    case KLFER_DUMP_LOGS_FLAG:
+        klfer_dump_logs(0, modData.num_of_logs);
         break;
 #ifdef DEBUG
     case KLFER_SAMPLE_FLAG:
@@ -387,7 +489,7 @@ static long klfer_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         break;
 #endif
     default:
-        ret = -EBADR;
+        ret = -EINVAL;
     }
     return ret;
 ERR_COPY_FROM_USER:
@@ -463,9 +565,13 @@ static void klfer_delete_dev(void)
  */
 static int __init klfer_init(void)
 {
-    klfer_init_mod_data();
+    if(klfer_init_mod_data())
+    {
+        return KLFER_ERR;
+    }
     if(klfer_create_dev())
     {
+        klfer_teardown_mod_data();
         return KLFER_ERR;
     }
     pr_info(KLFER_MOD_NAME "-" KLFER_MOD_VERSION ": loaded.\n");
@@ -477,7 +583,7 @@ static int __init klfer_init(void)
  */
 static void __exit klfer_exit(void)
 {
-    klfer_reset_funcs();
+    klfer_teardown_mod_data();
     klfer_delete_dev();
     pr_info(KLFER_MOD_NAME "-" KLFER_MOD_VERSION ": unloaded.\n");
 }

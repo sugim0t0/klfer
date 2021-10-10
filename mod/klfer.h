@@ -18,7 +18,7 @@
 
 /* Module name / version */
 #define KLFER_MOD_NAME    "klfer"
-#define KLFER_MOD_VERSION "0.1"
+#define KLFER_MOD_VERSION "0.4"
 
 #define KLFER_OK           0
 #define KLFER_ERR         -1
@@ -27,22 +27,21 @@
 #define MINOR_NUM          1
 
 #define MAX_REG_FUNCS      16
-#define MAX_GRPS           MAX_REG_FUNCS
+
+#define MAX_LOGS           1024
 
 struct klfer_reg_func
 {
-    struct kretprobe krp;
-    char             func_name[MAX_STR_LEN];
-    unsigned int     grp_idx;
-    bool             b_rec_timestamp;
-    bool             b_registered;
+    struct kretprobe      krp;
+    char                  func_name[MAX_STR_LEN];
+    bool                  b_registered;
 };
 
-struct klfer_grp
+struct klfer_log
 {
-    char grp_id[MAX_STR_LEN];
-    int  num_of_funcs;
-    int  cnt;
+    struct timespec       time;
+    int                   func_idx;
+    char                  event_id;
 };
 
 struct klfer_mod_data
@@ -51,10 +50,15 @@ struct klfer_mod_data
     struct class          *pclass;
     struct device         *pdev;
     struct cdev           chrdev;
-    struct klfer_grp      grps[MAX_GRPS];
     struct klfer_reg_func funcs[MAX_REG_FUNCS];
+    struct klfer_log      *logs;
+    int                   num_of_funcs;
+    int                   num_of_logs;
     atomic_t              open_available;
-    bool                  b_logging;
+    bool                  b_logging;   // Logger enable / disable
+    bool                  b_jit_log;   // JIT print log enable / disable
+    bool                  b_timestamp; // Timestamp enable / disable
+    char                  timestamp_fmt;
 };
 
 #endif /* _KLFER_H_ */
