@@ -34,7 +34,7 @@ MODULE_NAME = klfer
 MODULE_OBJS = klfer_mod.o
 ifeq ($(CONFIG_DEBUG), y)
     ccflags-y += -DDEBUG
-	MODULE_OBJS += klfer_dbg.o
+    MODULE_OBJS += klfer_dbg.o
 endif
 $(MODULE_NAME)-y = $(MODULE_OBJS)
 
